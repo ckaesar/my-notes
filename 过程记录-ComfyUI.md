@@ -8,10 +8,154 @@
 
 | 日期 | 记录 |
 |------|------|
+| 2026-10-01 | 日常使用问答（图片目录 / 耗时 / 内存 / 参数 / 配置存储） |
 | 2026-09-30 | Z-Image 出图失败：VAELoader 误用 pixel_space |
 | 2026-09-30 | 服务运行中崩溃的排查（Z-Image 加载时访问违规） |
 | 2026-09-30 | 模型下载失败（Chrome `.crdownload`）的恢复 |
 | 2026-09-29 | 独立 Python 环境搭建、依赖安装与服务启动 |
+
+---
+
+## 2026-10-01 · 日常使用问答（图片目录 / 耗时 / 内存 / 参数 / 配置存储）
+
+> 以下问答整理自 2026-09-30 ~ 2026-10-01 的使用过程，属知识性咨询，非故障排查。
+
+### Q1：本地生成的图片放在哪个目录？
+
+默认在 ComfyUI 根目录下的 `output`，本机即 **`d:\ComfyUI\output\`**。依据 [folder_paths.py](../folder_paths.py#L69-L70)：
+
+```python
+output_directory = os.path.join(base_path, "output")
+temp_directory = os.path.join(base_path, "temp")
+```
+
+| 目录 | 路径 | 用途 |
+|------|------|------|
+| 输出 | `d:\ComfyUI\output\` | `SaveImage` 保存的图片 |
+| 输入 | `d:\ComfyUI\input\` | `LoadImage` 读取的图片 |
+| 临时 | `d:\ComfyUI\temp\` | 预览图、中间文件 |
+
+文件名由 `SaveImage` 节点的 `filename_prefix`（当前为 `ComfyUI`）+ 5 位序号组成，如 `ComfyUI_00001_.png`。prefix 含斜杠时会自动建子目录。可用启动参数 `--output-directory "D:\AI-output"` 改变位置。
+
+### Q2：两张已生成图片的耗时分别是多少？
+
+| 项目 | ComfyUI_00001_.png | ComfyUI_00002_.png |
+|------|--------------------|--------------------|
+| 生成时间 | 2026-09-30 18:46:35 | 2026-10-01 20:34:59 |
+| 参数 | 512×512，8 步，seed 42 | 完全相同 |
+| 采样单步 | 262.27 秒 | 推算约 168 秒 |
+| 采样总时长 | 34:58（实测） | 推算约 22.5 分钟 |
+| 任务总耗时 | **39:23（实测）** | 约 24–27 分钟（推算） |
+
+- 图 1 有完整日志：`Prompt executed in 00:39:23`，其中净采样 34:58，其余约 4 分 25 秒为模型加载 + 文本编码 + VAE 解码；
+- 图 2 的运行日志不可得（服务在外部终端启动、ComfyUI 默认不写日志文件、PNG 元数据只有 `prompt` 和 `workflow` 两个字段、不含耗时），故为推算值；
+- 两张图的 PNG 元数据均只包含 `prompt` 与 `workflow`，不含任何耗时信息。
+
+### Q3：每次重启服务后第一次生图都会更慢吗？
+
+**机制上成立**：重启会清空模型缓存，第一次运行必须重新加载模型（文本编码器 7.67 GB + 扩散模型 23.5 GB），本次实测这部分开销约 4 分 25 秒。
+
+但要注意，采样单步从 262 秒降到 168 秒的差异**不能全归因于"第一次"**——模型加载发生在采样之前，不会影响单步速度。更可能的原因是**运行时内存压力**：图 1 那次系统空闲内存只剩约 1.2 GB，部分权重被换出到页面文件，采样时反复缺页换入换出，单步被拖慢。
+
+结论：冷启动必然多付一次加载成本；单步快慢主要取决于内存是否够用（建议运行时保持 20 GB 以上空闲内存）。
+
+### Q4：一次跑多张图会让内存占用翻倍吗？
+
+**不会。** 内存大头是模型权重（约 31 GB），任何情况下都只加载一份。
+
+| 部分 | 大小 | 是否随张数增长 |
+|------|------|----------------|
+| 模型权重（文本编码器 + 扩散模型） | 7.67 GB + 23.5 GB | 不增长 |
+| 采样中间激活 | 几百 MB 量级（512×512） | 随 batch 线性增长 |
+| 输出图像 | 约 3 MB/张 | 可忽略 |
+
+| 运行方式 | 模型权重 | 中间激活 | 总体影响 |
+|----------|----------|----------|----------|
+| batch_size = 2（同批并行） | 1 份 | ×2 | 增加几百 MB ~ 1 GB（估算） |
+| 队列连续跑 2 个任务 | 1 份 | 用完即释放 | 基本不变，最省内存 |
+| 两套用不同模型的工作流 | 2 份叠加 | — | 显著增加 |
+
+真正需要留意的是 ComfyUI 的结果缓存（`Using RAM pressure cache`）：默认活跃缓存阈值约为系统内存的 10%（本机约 3.2 GB），连续快速跑多张时会累积。
+
+建议：想跑多张优先用队列连续跑，而不是调大 `batch_size`。
+
+### Q5：当前的 batch_size 是多少？
+
+**1**。依据最近一张图的元数据：
+
+```json
+[68] EmptySD3LatentImage: {'width': 512, 'height': 512, 'batch_size': 1}
+```
+
+注意：在 ComfyUI 中 batch 由 latent 决定（`EmptySD3LatentImage` 节点的 `batch_size` 参数），`KSampler` 本身没有独立的 batch 设置。
+
+### Q6：seed（随机种子）是什么？怎么改？
+
+`seed` 是决定"从哪一团随机噪声开始生成"的数字。扩散模型从纯随机噪声逐步去噪成图像，这个初始噪声由 seed 通过伪随机算法算出：
+
+- seed 相同 + 提示词相同 + 参数相同 → 每次得到完全相同的图；
+- seed 不同 → 得到不同的图（提示词不变时画面主题接近，构图与细节会变）。
+
+当前工作流是 `seed = 42` + `control_after_generate: fixed`，所以每次运行都出同一张图。`KSampler` 的 seed 输入框右侧下拉菜单控制每次运行后的行为：
+
+| 选项 | 行为 |
+|------|------|
+| `fixed` | 运行后不变（当前设置） |
+| `increment` | 每次运行后 seed +1 |
+| `decrement` | 每次运行后 seed −1 |
+| `randomize` | 每次运行前随机取新 seed |
+
+改 seed 不影响耗时（仍是 8 步采样）。另外，若把 `batch_size` 改为 2 而 seed 保持 `fixed`，两张图会完全相同。
+
+### Q7：ComfyUI 的配置是以文件形式存储的吗？
+
+基本是，只有一处用 SQLite 数据库：
+
+| 配置类型 | 存储形式与路径 | 说明 |
+|----------|----------------|------|
+| 界面设置 | `user\default\comfy.settings.json` | 面板开关、教程状态、模板排序等 |
+| 用户数据 | `user\comfyui.db` | SQLite，存资产记录、标签等 |
+| 保存的工作流 | `user\default\workflows\` | 见 Q8 |
+| 自定义样式 | `user\default\user.css`（可选） | 不存在时前端会报 `ERR_ABORTED /api/userdata/user.css` |
+| 模型路径扩展 | `extra_model_paths.yaml`（根目录，需手动创建） | 用于挂载外部模型目录 |
+| 启动参数 | 不是文件 | 通过命令行或 `.bat` 脚本传入 |
+
+[user_manager.py](../app/user_manager.py#L44) 中有一条日志印证了存储方式的变化：
+
+```
+User settings have been changed to be stored on the server instead of browser storage.
+```
+
+即设置已在服务端文件存储，前端通过 `/userdata/{file}` 接口读写（[user_manager.py](../app/user_manager.py#L334-L362)）。备份/迁移时拷贝 `user\` 整个目录即可带上设置、数据库与工作流。
+
+### Q8：保存的生图工作流放在哪个目录？
+
+**`d:\ComfyUI\user\default\workflows\`**。
+
+路径由两段规则组合而成：
+
+1. 前端定义工作流基路径为 `workflows/`（`comfyui_frontend_package` 静态资源中：`class ComfyWorkflow extends ... { static basePath = 'workflows/' }`），通过 `/userdata/workflows/<文件名>.json` 读写；
+2. 后端的 userdata 路径规则是 `user/<用户 ID>/<文件>`（[user_manager.py](../app/user_manager.py#L72-L103)），`user` 根目录在 [folder_paths.py](../folder_paths.py#L72) 中定义，默认用户 ID 为 `default`。
+
+需要区分的三种情况：
+
+| 情况 | 存储位置 |
+|------|----------|
+| 界面里点**保存**（Save）的工作流 | `user\default\workflows\<名字>.json`（服务端文件） |
+| **未保存**的临时工作流 | 浏览器本地存储（服务端无文件） |
+| 手动**导出**（Export）的 JSON | 自己选择的位置 |
+
+该目录下还会有 `workflows\.index.json`，用于记录工作流的收藏/书签索引，不是工作流本身。
+
+### 小结
+
+| 主题 | 结论 |
+|------|------|
+| 图片输出 | `d:\ComfyUI\output\`，可用 `--output-directory` 改 |
+| 耗时 | 冷启动首张约 39 分钟（含加载）；模型已缓存时更快，瓶颈是 CPU 算力与内存 |
+| 内存 | 模型权重固定一份（约 31 GB），多张图不会翻倍；风险来自结果缓存与系统其他程序 |
+| 参数 | batch 由 latent 决定（当前 1）；seed + `control_after_generate` 控制出图是否重复 |
+| 配置 | 均在 `user\` 目录下的 JSON / SQLite / 工作流文件 |
 
 ---
 
